@@ -1,0 +1,151 @@
+# ==============================================================
+# Proyecto Diseño de Software — versión 6:
+# api_facturas (:8065) + FRONT Flask (:8066) + TRES motores
+#
+#   Navegador → FRONT (Flask, :8066) → API FACTURAS (C#, :8065)
+#                                          ──┬→ PostgreSQL (:15459)
+#               (una ruta por entidad)      ├→ SQL Server (:11459)
+#                                           └→ MariaDB   (:13353)
+#                                              interruptor: MOTOR_BD
+#
+# Uso: docker compose up -d --build     (UN solo comando)
+#   La API habla con PostgreSQL por defecto; para cambiar de motor
+#   SIN tocar código:  $env:MOTOR_BD="sqlserver"  (o "mariadb")
+#                      docker compose up -d api-facturas
+# Reset de las BD: docker compose down -v && docker compose up -d
+#
+# Este archivo CRECE por versiones: la ruta del front sigue en los
+# ==============================================================
+services:
+
+  # --- PostgreSQL 16 (liviano: la imagen pesa ~50 MB) ---
+  postgres:
+    restart: unless-stopped   # si el PC se reinicia, este servicio revive con Docker
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: "Diseno123!"    # clave del superusuario 'postgres'
+      POSTGRES_DB: bdfacturas_postgres_local   # la BD que crea al nacer
+    volumes:
+      - pgdata:/var/lib/postgresql/data        # los datos sobreviven a `down`
+      # PostgreSQL SÍ ejecuta automáticamente los scripts montados aquí
+      # la PRIMERA vez (con el volumen vacío) — por eso este proyecto no
+      # necesita contenedor inicializador:
+      - ./db/bdfacturas_postgres.sql:/docker-entrypoint-initdb.d/bdfacturas_postgres.sql:ro
+    ports:
+      - "15459:5432"     # puerto en su PC (para SQLTools/pgAdmin opcional)
+    healthcheck:
+      # ¿La BD ya RESPONDE consultas? (no solo "el contenedor existe")
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bdfacturas_postgres_local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- SQL Server 2022 — el SEGUNDO motor (v4). Requiere ~2 GB de RAM ---
+  sqlserver:
+    restart: unless-stopped   # si el PC se reinicia, este servicio revive con Docker
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"                       # aceptar la licencia (obligatorio)
+      MSSQL_SA_PASSWORD: "Diseno123!"  # clave del superusuario 'sa'
+      MSSQL_PID: Developer                   # edición gratuita para desarrollo
+    volumes:
+      - mssqldata:/var/opt/mssql
+    ports:
+      - "11459:1433"     # puerto en su PC (para SQLTools/pgAdmin de SQL opcional)
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' -b"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s   # margen de gracia: SQL Server tarda en arrancar
+
+  # --- Inicializador de SQL Server (v4): la lección prometida en v1 ---
+  # PostgreSQL se siembra solo; SQL Server NO ejecuta scripts montados —
+  # este contenedor se conecta, corre el script UNA vez y muere.
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "Diseno123!"
+    volumes:
+      - ./db:/scripts:ro
+    entrypoint: ["/bin/bash", "/scripts/init_sqlserver.sh"]
+    restart: "no"
+
+  # --- MariaDB 11 — el TERCER motor (v5): también se siembra solo ---
+  mariadb:
+    restart: unless-stopped   # si el PC se reinicia, este servicio revive con Docker
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: "Diseno123!"
+    volumes:
+      - mariadbdata:/var/lib/mysql
+      - ./db/bdfacturas_mariadb.sql:/docker-entrypoint-initdb.d/bdfacturas_mariadb.sql:ro
+    ports:
+      - "13353:3306"     # puerto en su PC (para HeidiSQL/DBeaver opcional)
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- API Facturas — C# / ASP.NET Core (v5: tri-motor) ---
+  api-facturas:
+    build: ./api_facturas
+    volumes:
+      - ./api_facturas:/app      # el código montado: guardar un .cs recompila solo
+      - /app/bin                 # bin y obj quedan DENTRO del contenedor (Linux),
+      - /app/obj                 #   sin mezclarse con los compilados de Windows
+    restart: unless-stopped
+    ports:
+      - "8065:8065"              # http://localhost:8065
+    environment:
+      # La cadena usa el NOMBRE del servicio como host (postgres:5432),
+      # no localhost: dentro de la red interna de compose los servicios
+      # se resuelven por nombre. Esta variable SOBREESCRIBE el valor de
+      # appsettings.json (ASP.NET lee "ConnectionStrings__X" así).
+      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=bdfacturas_postgres_local;Username=postgres;Password=Diseno123!"
+      # v4 — la cadena del SEGUNDO motor (host interno sqlserver,1433):
+      ConnectionStrings__SqlServer: "Server=sqlserver,1433;Database=bdfacturas_sqlserver_local;User Id=sa;Password=Diseno123!;TrustServerCertificate=True;"
+      # v4 — EL INTERRUPTOR: a qué motor le habla la API. Lee la
+      # variable MOTOR_BD de su terminal; si no existe, postgres.
+      # Cambiar de motor = recrear SOLO este contenedor (segundos):
+      #   $env:MOTOR_BD="sqlserver"; docker compose up -d api-facturas
+      # v5 — la cadena del TERCER motor (host interno mariadb:3306):
+      ConnectionStrings__MariaDb: "Server=mariadb;Port=3306;Database=bdfacturas_mariadb_local;User ID=root;Password=Diseno123!;AllowUserVariables=True"
+      Motor: ${MOTOR_BD:-postgres}
+    depends_on:
+      postgres:
+        condition: service_healthy
+        # ↑ la API arranca cuando la BD ya RESPONDE (y como el script se
+        #   auto-ejecutó al nacer, ya existe con sus 12 tablas y datos).
+      sqlserver-init:
+        condition: service_completed_successfully
+        # ↑ v4: …y cuando el inicializador de SQL Server TERMINÓ BIEN.
+      mariadb:
+        condition: service_healthy
+        # ↑ v5: …y cuando el tercer motor responde (se siembra solo).
+
+
+  # --- FRONT (v6): Flask + Jinja2 + Bootstrap — la capa de presentación ---
+  # El front NO toca la BD: su única fuente es la API (por el DNS interno).
+  front-flask:
+    build: ./front_flask
+    volumes:
+      - ./front_flask:/app           # el código montado: editar y refrescar
+    restart: unless-stopped   # si el PC se reinicia, este servicio revive con Docker
+    ports:
+      - "8066:8066"                  # http://localhost:8066
+    environment:
+      API_FACTURAS_URL: http://api-facturas:8065
+      CLAVE_SESION: Diseno123!Sesion
+    depends_on:
+      - api-facturas
+
+
+volumes:
+  pgdata:      # declaración del volumen nombrado (la "memoria" de la BD)
+  mssqldata:   # v4: la "memoria" del segundo motor
+  mariadbdata: # v5: la "memoria" del tercero
